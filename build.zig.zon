@@ -1,0 +1,13 @@
+.{
+    .name = .quickcheck,
+    .version = "0.1.0",
+    .fingerprint = 0xad5049351707c38d,
+    .minimum_zig_version = "0.15.0",
+    .paths = .{
+        "src",
+        "build.zig",
+        "build.zig.zon",
+        "README.md",
+        "LICENSE",
+    },
+}
