@@ -4,26 +4,39 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Get git hash at build time
+    const git_hash = b.run(&.{ "git", "rev-parse", "--short", "HEAD" });
+
+    // Version can be overridden: zig build -Dversion=1.2.3
+    const version = b.option([]const u8, "version", "Semantic version (default: 0.1.0)") orelse "0.1.0";
+
+    // Build options for version info
+    const options = b.addOptions();
+    options.addOption([]const u8, "git_hash", std.mem.trim(u8, git_hash, "\n\r "));
+    options.addOption([]const u8, "version", version);
+
     // Library module
-    const quickcheck_mod = b.createModule(.{
-        .root_source_file = b.path("src/quickcheck.zig"),
+    const zcheck_mod = b.createModule(.{
+        .root_source_file = b.path("src/zcheck.zig"),
         .target = target,
         .optimize = optimize,
     });
+    zcheck_mod.addOptions("build_options", options);
 
     // Export the module for dependents
-    _ = b.addModule("quickcheck", .{
-        .root_source_file = b.path("src/quickcheck.zig"),
+    _ = b.addModule("zcheck", .{
+        .root_source_file = b.path("src/zcheck.zig"),
         .target = target,
         .optimize = optimize,
     });
 
     // Unit tests
     const test_mod = b.createModule(.{
-        .root_source_file = b.path("src/quickcheck.zig"),
+        .root_source_file = b.path("src/zcheck.zig"),
         .target = target,
         .optimize = optimize,
     });
+    test_mod.addOptions("build_options", options);
 
     const unit_tests = b.addTest(.{
         .root_module = test_mod,
@@ -40,7 +53,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "quickcheck", .module = quickcheck_mod },
+            .{ .name = "zcheck", .module = zcheck_mod },
         },
     });
 

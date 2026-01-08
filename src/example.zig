@@ -1,12 +1,12 @@
 const std = @import("std");
-const qc = @import("quickcheck");
+const zc = @import("zcheck");
 
 pub fn main() !void {
-    std.debug.print("Running quickcheck examples...\n\n", .{});
+    std.debug.print("Running zcheck examples...\n\n", .{});
 
     // Example 1: Testing addition commutativity
     std.debug.print("Testing: addition is commutative\n", .{});
-    try qc.check(struct {
+    try zc.check(struct {
         fn prop(args: struct { a: i16, b: i16 }) bool {
             const sum1 = @as(i32, args.a) + @as(i32, args.b);
             const sum2 = @as(i32, args.b) + @as(i32, args.a);
@@ -17,7 +17,7 @@ pub fn main() !void {
 
     // Example 2: Testing sort is idempotent
     std.debug.print("Testing: sorting twice equals sorting once\n", .{});
-    try qc.check(struct {
+    try zc.check(struct {
         fn prop(args: struct { arr: [8]u8 }) bool {
             var sorted1 = args.arr;
             var sorted2 = args.arr;
@@ -37,7 +37,7 @@ pub fn main() !void {
     const random = prng.random();
 
     for (0..1000) |_| {
-        const v = qc.intRange(i32, random, -100, 100);
+        const v = zc.intRange(i32, random, -100, 100);
         const abs_v = @abs(v);
         if (abs_v > 100) {
             std.debug.print("  FAILED: {} -> {}\n", .{ v, abs_v });
