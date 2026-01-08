@@ -29,6 +29,8 @@ const testing = std.testing;
 /// Maximum length for generated strings
 pub const MAX_STRING_LEN: usize = 64;
 
+const file_path_extensions = [_][]const u8{ ".zig", ".rs", ".py", ".js", ".ts", ".go", ".c", ".h" };
+
 /// Bounded string type for property testing (no allocation needed).
 /// Use .slice() to get the actual string data.
 pub const String = struct {
@@ -58,6 +60,7 @@ pub const Id = struct {
     len: usize = 0,
 
     pub const MAX_LEN = 36;
+    pub const MIN_LEN = 8;
 
     pub fn slice(self: *const Id) []const u8 {
         return self.buf[0..self.len];
@@ -70,61 +73,88 @@ pub const FilePath = struct {
     len: usize = 0,
 
     pub const MAX_LEN = 128;
+    pub const MIN_NAME_LEN = 1;
 
     pub fn slice(self: *const FilePath) []const u8 {
         return self.buf[0..self.len];
     }
 };
 
+/// Bounded generic slice type for property testing (no allocation needed).
+pub fn BoundedSlice(comptime T: type, comptime max_len: usize) type {
+    return struct {
+        const Self = @This();
+
+        buf: [max_len]T = undefined,
+        len: usize = 0,
+
+        pub const MAX_LEN = max_len;
+        pub const Elem = T;
+        pub const is_bounded_slice = true;
+
+        pub fn slice(self: *const Self) []const T {
+            return self.buf[0..self.len];
+        }
+
+        pub fn sliceMut(self: *Self) []T {
+            return self.buf[0..self.len];
+        }
+
+        pub fn fromSlice(s: []const T) Self {
+            var result = Self{};
+            const copy_len = @min(s.len, max_len);
+            std.mem.copyForwards(T, result.buf[0..copy_len], s[0..copy_len]);
+            result.len = copy_len;
+            return result;
+        }
+    };
+}
+
 /// Configuration for property tests.
 pub const Config = struct {
     /// Number of random test cases to generate.
     iterations: usize = 100,
-    /// Random seed (0 = use timestamp).
+    /// Random seed for internal PRNG (0 = use timestamp).
     seed: u64 = 0,
     /// Maximum shrink attempts per failure.
     max_shrinks: usize = 100,
     /// If true, test passes when property fails (for testing shrinking).
     expect_failure: bool = false,
+    /// If true, print counterexample details on failure.
+    print_failures: bool = true,
+    /// If true, use struct field default values where provided.
+    use_default_values: bool = true,
+    /// Optional external RNG to use instead of an internal PRNG.
+    /// When set, seed is used only for failure reporting.
+    random: ?std.Random = null,
 };
+
+pub fn Failure(comptime Args: type) type {
+    return struct {
+        seed: u64,
+        iteration: usize,
+        original: Args,
+        shrunk: Args,
+    };
+}
 
 /// Run a property test with the given property function.
 /// The property function takes a struct of generated values and returns bool.
 /// Returns error if a counterexample is found.
 pub fn check(comptime property: anytype, config: Config) !void {
     const Args = @typeInfo(@TypeOf(property)).@"fn".params[0].type.?;
-    try checkType(Args, property, config);
-}
+    const failure = checkType(Args, property, config);
 
-fn checkType(comptime Args: type, comptime property: anytype, config: Config) !void {
-    const seed = if (config.seed == 0) blk: {
-        break :blk @as(u64, @intCast(std.time.timestamp()));
-    } else config.seed;
-
-    var prng = std.Random.DefaultPrng.init(seed);
-    const random = prng.random();
-
-    var i: usize = 0;
-    while (i < config.iterations) : (i += 1) {
-        const args = generate(Args, random);
-
-        if (!property(args)) {
-            // Found counterexample, try to shrink it
-            const shrunk = shrinkLoop(Args, property, args, config.max_shrinks);
-
-            if (config.expect_failure) {
-                // Test is verifying that shrinking works - success!
-                return;
-            }
-
-            std.debug.print("\n=== Property failed ===\n", .{});
-            std.debug.print("Seed: {}\n", .{seed});
-            std.debug.print("Iteration: {}\n", .{i});
-            std.debug.print("Original: {any}\n", .{args});
-            std.debug.print("Shrunk:   {any}\n", .{shrunk});
-
-            return error.PropertyFailed;
+    if (failure) |details| {
+        if (config.expect_failure) {
+            return;
         }
+
+        if (config.print_failures) {
+            printFailure(Args, details);
+        }
+
+        return error.PropertyFailed;
     }
 
     // If we expected a failure but property always passed, that's an error
@@ -133,24 +163,89 @@ fn checkType(comptime Args: type, comptime property: anytype, config: Config) !v
     }
 }
 
+/// Run a property test and return failure details (if any) without printing.
+pub fn checkResult(comptime property: anytype, config: Config) ?Failure(@typeInfo(@TypeOf(property)).@"fn".params[0].type.?) {
+    const Args = @typeInfo(@TypeOf(property)).@"fn".params[0].type.?;
+    return checkType(Args, property, config);
+}
+
+fn checkType(comptime Args: type, comptime property: anytype, config: Config) ?Failure(Args) {
+    var seed: u64 = config.seed;
+    var prng: std.Random.DefaultPrng = undefined;
+    var random: std.Random = undefined;
+
+    if (config.random) |external| {
+        random = external;
+    } else {
+        if (seed == 0) {
+            seed = @as(u64, @intCast(std.time.timestamp()));
+        }
+        prng = std.Random.DefaultPrng.init(seed);
+        random = prng.random();
+    }
+
+    var i: usize = 0;
+    while (i < config.iterations) : (i += 1) {
+        const args = generateWithConfig(Args, random, .{ .use_default_values = config.use_default_values });
+
+        if (!property(args)) {
+            // Found counterexample, try to shrink it
+            const shrunk = shrinkLoop(Args, property, args, config.max_shrinks, .{ .use_default_values = config.use_default_values });
+            return Failure(Args){
+                .seed = seed,
+                .iteration = i,
+                .original = args,
+                .shrunk = shrunk,
+            };
+        }
+    }
+    return null;
+}
+
+fn printFailure(comptime Args: type, failure: Failure(Args)) void {
+    std.debug.print("\n=== Property failed ===\n", .{});
+    std.debug.print("Seed: {}\n", .{failure.seed});
+    std.debug.print("Iteration: {}\n", .{failure.iteration});
+    std.debug.print("Original: {any}\n", .{failure.original});
+    std.debug.print("Shrunk:   {any}\n", .{failure.shrunk});
+}
+
 /// Generate a random value of type T.
 pub fn generate(comptime T: type, random: std.Random) T {
+    return generateWithConfig(T, random, .{});
+}
+
+pub const GenerateConfig = struct {
+    use_default_values: bool = true,
+};
+
+fn isBoundedSlice(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .@"struct" => @hasDecl(T, "is_bounded_slice") and T.is_bounded_slice,
+        else => false,
+    };
+}
+
+/// Generate a random value of type T with configurable behavior.
+pub fn generateWithConfig(comptime T: type, random: std.Random, config: GenerateConfig) T {
     // Handle special string types first
     if (T == String) return generateString(random);
     if (T == Id) return generateId(random);
     if (T == FilePath) return generateFilePath(random);
+    if (comptime isBoundedSlice(T)) return generateBoundedSlice(T, random, config);
 
     return switch (@typeInfo(T)) {
         .int => generateInt(T, random),
         .float => generateFloat(T, random),
         .bool => random.boolean(),
         .@"enum" => generateEnum(T, random),
-        .optional => |opt| if (random.boolean()) generate(opt.child, random) else null,
-        .array => |arr| generateArray(arr.child, arr.len, random),
-        .@"struct" => |s| generateStruct(T, s, random),
+        .optional => |opt| if (random.boolean()) generateWithConfig(opt.child, random, config) else null,
+        .array => |arr| generateArray(arr.child, arr.len, random, config),
+        .@"struct" => |s| generateStruct(T, s, random, config),
+        .@"union" => |u| generateUnion(T, u, random, config),
         .pointer => |ptr| switch (ptr.size) {
-            .slice => @panic("Cannot generate slices - use String, Id, or FilePath types instead"),
-            else => @panic("Cannot generate pointers"),
+            .slice => @compileError("Cannot generate slices - use String, Id, FilePath, or BoundedSlice"),
+            else => @compileError("Cannot generate pointer types"),
         },
         else => @compileError("Cannot generate type: " ++ @typeName(T)),
     };
@@ -174,8 +269,8 @@ fn generateString(random: std.Random) String {
 fn generateId(random: std.Random) Id {
     var result = Id{};
     const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
-    // IDs are typically 8-36 chars
-    result.len = random.intRangeAtMost(usize, 8, 36);
+    // IDs are typically bounded length
+    result.len = random.intRangeAtMost(usize, Id.MIN_LEN, Id.MAX_LEN);
     for (result.buf[0..result.len]) |*c| {
         c.* = chars[random.uintLessThan(usize, chars.len)];
     }
@@ -184,8 +279,7 @@ fn generateId(random: std.Random) Id {
 
 fn generateFilePath(random: std.Random) FilePath {
     var result = FilePath{};
-    const extensions = [_][]const u8{ ".zig", ".rs", ".py", ".js", ".ts", ".go", ".c", ".h" };
-    const ext = extensions[random.uintLessThan(usize, extensions.len)];
+    const ext = file_path_extensions[random.uintLessThan(usize, file_path_extensions.len)];
 
     // Generate path like /dir/file.ext
     result.buf[0] = '/';
@@ -195,6 +289,29 @@ fn generateFilePath(random: std.Random) FilePath {
     }
     @memcpy(result.buf[name_len + 1 ..][0..ext.len], ext);
     result.len = name_len + 1 + ext.len;
+    return result;
+}
+
+fn generateBoundedSlice(comptime T: type, random: std.Random, config: GenerateConfig) T {
+    const Elem = T.Elem;
+    const max_len = T.MAX_LEN;
+    var result: T = undefined;
+
+    if (max_len == 0) {
+        result.len = 0;
+        return result;
+    }
+
+    // 10% chance of empty
+    if (random.uintLessThan(u8, 10) == 0) {
+        result.len = 0;
+        return result;
+    }
+
+    result.len = random.uintLessThan(usize, max_len) + 1;
+    for (result.buf[0..result.len]) |*elem| {
+        elem.* = generateWithConfig(Elem, random, config);
+    }
     return result;
 }
 
@@ -216,10 +333,28 @@ fn generateInt(comptime T: type, random: std.Random) T {
 fn generateFloat(comptime T: type, random: std.Random) T {
     // 20% chance of special values
     if (random.uintLessThan(u8, 5) == 0) {
-        const specials = [_]T{ 0.0, 1.0, -1.0, std.math.floatMin(T), std.math.floatMax(T) };
+        const specials = [_]T{
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            std.math.floatMin(T),
+            -std.math.floatMin(T),
+            std.math.floatTrueMin(T),
+            -std.math.floatTrueMin(T),
+            std.math.floatMax(T),
+            -std.math.floatMax(T),
+        };
         return specials[random.uintLessThan(usize, specials.len)];
     }
-    return @as(T, @floatFromInt(random.int(i32))) / 1000.0;
+    const U = std.meta.Int(.unsigned, @bitSizeOf(T));
+    while (true) {
+        const bits = random.int(U);
+        const value = @as(T, @bitCast(bits));
+        if (!std.math.isNan(value) and !std.math.isInf(value)) {
+            return value;
+        }
+    }
 }
 
 fn generateEnum(comptime T: type, random: std.Random) T {
@@ -232,67 +367,139 @@ fn generateEnum(comptime T: type, random: std.Random) T {
     unreachable;
 }
 
-fn generateArray(comptime Child: type, comptime len: usize, random: std.Random) [len]Child {
+fn generateUnion(comptime T: type, comptime u: std.builtin.Type.Union, random: std.Random, config: GenerateConfig) T {
+    if (u.tag_type == null) {
+        @compileError("Cannot generate untagged union: " ++ @typeName(T));
+    }
+
+    const fields = u.fields;
+    const idx = random.uintLessThan(usize, fields.len);
+    inline for (fields, 0..) |field, i| {
+        if (i == idx) {
+            return @unionInit(T, field.name, generateWithConfig(field.type, random, config));
+        }
+    }
+    unreachable;
+}
+
+fn generateArray(comptime Child: type, comptime len: usize, random: std.Random, config: GenerateConfig) [len]Child {
     var result: [len]Child = undefined;
     for (&result) |*elem| {
-        elem.* = generate(Child, random);
+        elem.* = generateWithConfig(Child, random, config);
     }
     return result;
 }
 
-fn generateStruct(comptime T: type, comptime s: std.builtin.Type.Struct, random: std.Random) T {
+fn generateStruct(comptime T: type, comptime s: std.builtin.Type.Struct, random: std.Random, config: GenerateConfig) T {
     var result: T = undefined;
     inline for (s.fields) |field| {
-        @field(result, field.name) = generate(field.type, random);
+        if (field.is_comptime) {
+            if (field.defaultValue()) |default_value| {
+                @field(result, field.name) = default_value;
+                continue;
+            }
+            @compileError("Cannot generate struct with comptime field without default: " ++ field.name);
+        }
+        if (config.use_default_values) {
+            if (comptime (field.defaultValue() != null)) {
+                @field(result, field.name) = field.defaultValue().?;
+            } else {
+                @field(result, field.name) = generateWithConfig(field.type, random, config);
+            }
+        } else {
+            @field(result, field.name) = generateWithConfig(field.type, random, config);
+        }
     }
     return result;
 }
 
 /// Shrink a value toward a simpler form that still fails the property.
-fn shrinkLoop(comptime T: type, comptime property: anytype, initial: T, max_attempts: usize) T {
+fn shrinkLoop(comptime T: type, comptime property: anytype, initial: T, max_attempts: usize, config: ShrinkConfig) T {
     var current = initial;
-    var attempts: usize = 0;
+    var budget: usize = max_attempts;
 
-    while (attempts < max_attempts) {
-        if (shrinkOnce(T, current)) |simpler| {
-            if (!property(simpler)) {
-                current = simpler;
-                attempts = 0; // Reset on progress
-                continue;
-            }
+    while (budget > 0) {
+        if (tryShrink(T, current, property, &budget, config)) |simpler| {
+            current = simpler;
+            continue;
         }
-        attempts += 1;
-
-        // Try shrinking each field independently for structs
-        if (@typeInfo(T) == .@"struct") {
-            if (shrinkStructField(T, current, property)) |simpler| {
-                current = simpler;
-                attempts = 0;
-                continue;
-            }
-        }
-
         break;
     }
 
     return current;
 }
 
+const ShrinkConfig = struct {
+    use_default_values: bool = true,
+};
+
+fn tryCandidate(comptime T: type, candidate: T, comptime property: anytype, budget: *usize) bool {
+    if (budget.* == 0) return false;
+    budget.* -= 1;
+    return !property(candidate);
+}
+
+fn tryShrink(comptime T: type, value: T, comptime property: anytype, budget: *usize, config: ShrinkConfig) ?T {
+    if (comptime isBoundedSlice(T)) {
+        if (shrinkOnceWithConfig(T, value, config)) |simpler| {
+            if (tryCandidate(T, simpler, property, budget)) return simpler;
+        }
+        return shrinkBoundedSliceField(T, value, property, budget, config);
+    }
+
+    return switch (@typeInfo(T)) {
+        .int => blk: {
+            if (shrinkInt(T, value)) |simpler| {
+                if (tryCandidate(T, simpler, property, budget)) break :blk simpler;
+            }
+            if (shrinkIntStep(T, value)) |step| {
+                if (tryCandidate(T, step, property, budget)) break :blk step;
+            }
+            break :blk null;
+        },
+        .@"union" => blk: {
+            const Context = struct { budget: *usize };
+            var ctx = Context{ .budget = budget };
+            break :blk findUnionCandidate(T, value, config, &ctx, property, struct {
+                fn accept(context: *Context, candidate: T, comptime prop: anytype) bool {
+                    return tryCandidate(T, candidate, prop, context.budget);
+                }
+            }.accept);
+        },
+        else => blk: {
+            if (shrinkOnceWithConfig(T, value, config)) |simpler| {
+                if (tryCandidate(T, simpler, property, budget)) break :blk simpler;
+            }
+            break :blk switch (@typeInfo(T)) {
+                .array => shrinkArrayField(T, value, property, budget, config),
+                .@"struct" => shrinkStructField(T, value, property, budget, config),
+                else => null,
+            };
+        },
+    };
+}
+
 /// Try to shrink a value one step.
 fn shrinkOnce(comptime T: type, value: T) ?T {
+    return shrinkOnceWithConfig(T, value, .{});
+}
+
+fn shrinkOnceWithConfig(comptime T: type, value: T, config: ShrinkConfig) ?T {
     // Handle special string types first
     if (T == String) return shrinkString(value);
     if (T == Id) return shrinkId(value);
     if (T == FilePath) return shrinkFilePath(value);
+    if (comptime isBoundedSlice(T)) return shrinkBoundedSlice(T, value);
 
     return switch (@typeInfo(T)) {
         .int => shrinkInt(T, value),
         .float => shrinkFloat(T, value),
         .bool => if (value) false else null,
         .optional => if (value != null) @as(T, null) else null,
-        .array => |arr| shrinkArray(arr.child, arr.len, value),
-        .@"struct" => |s| shrinkStruct(T, s, value),
-        .@"enum" => null, // Can't shrink enums meaningfully
+        .array => |arr| shrinkArray(arr.child, arr.len, value, config),
+        .@"struct" => |s| shrinkStruct(T, s, value, config),
+        .@"union" => |u| shrinkUnion(T, u, value, config),
+        .@"enum" => shrinkEnum(T, value),
         else => null,
     };
 }
@@ -311,24 +518,40 @@ fn shrinkString(value: String) ?String {
 
 fn shrinkId(value: Id) ?Id {
     if (value.len == 0) return null;
-    if (value.len > 8) {
-        // Shrink toward minimum ID length (8)
+    if (value.len > Id.MIN_LEN) {
+        // Shrink toward minimum ID length
         var result = value;
-        result.len = @max(8, value.len / 2);
+        result.len = @max(Id.MIN_LEN, value.len / 2);
         return result;
     }
-    return null; // Don't shrink below 8 chars
+    return null; // Don't shrink below minimum
 }
 
 fn shrinkFilePath(value: FilePath) ?FilePath {
     if (value.len == 0) return null;
-    // Try to shrink path length
-    if (value.len > 6) { // Minimum: "/a.zig"
-        var result = value;
-        result.len = @max(6, value.len / 2);
-        return result;
+    const slice = value.slice();
+    const dot_index = std.mem.lastIndexOfScalar(u8, slice, '.') orelse return null;
+    if (dot_index <= 1) return null;
+
+    const name_len = dot_index - 1;
+    if (name_len <= FilePath.MIN_NAME_LEN) return null;
+
+    const ext_len = slice.len - dot_index;
+    const new_name_len = @max(FilePath.MIN_NAME_LEN, name_len / 2);
+    var result = value;
+    const new_ext_start = 1 + new_name_len;
+    if (new_ext_start != dot_index) {
+        std.mem.copyForwards(u8, result.buf[new_ext_start .. new_ext_start + ext_len], value.buf[dot_index .. dot_index + ext_len]);
     }
-    return null;
+    result.len = new_ext_start + ext_len;
+    return result;
+}
+
+fn shrinkBoundedSlice(comptime T: type, value: T) ?T {
+    if (value.len == 0) return null;
+    var result = value;
+    result.len = value.len / 2;
+    return result;
 }
 
 fn shrinkInt(comptime T: type, value: T) ?T {
@@ -342,17 +565,37 @@ fn shrinkInt(comptime T: type, value: T) ?T {
     return @divTrunc(value, 2);
 }
 
+fn shrinkIntStep(comptime T: type, value: T) ?T {
+    if (value == 0) return null;
+    if (@typeInfo(T).int.signedness == .unsigned) {
+        return value - 1;
+    }
+    if (value > 0) return value - 1;
+    return value + 1;
+}
+
 fn shrinkFloat(comptime T: type, value: T) ?T {
     if (value == 0.0) return null;
     if (@abs(value) < 0.001) return 0.0;
     return value / 2.0;
 }
 
-fn shrinkArray(comptime Child: type, comptime len: usize, value: [len]Child) ?[len]Child {
+fn shrinkEnum(comptime T: type, value: T) ?T {
+    const fields = @typeInfo(T).@"enum".fields;
+    inline for (fields, 0..) |field, i| {
+        if (@intFromEnum(value) == field.value) {
+            if (i == 0) return null;
+            return @as(T, @enumFromInt(fields[i - 1].value));
+        }
+    }
+    return null;
+}
+
+fn shrinkArray(comptime Child: type, comptime len: usize, value: [len]Child, config: ShrinkConfig) ?[len]Child {
     // Try to shrink each element
     var result = value;
     for (&result, 0..) |*elem, i| {
-        if (shrinkOnce(Child, value[i])) |simpler| {
+        if (shrinkOnceWithConfig(Child, value[i], config)) |simpler| {
             elem.* = simpler;
             return result;
         }
@@ -360,31 +603,279 @@ fn shrinkArray(comptime Child: type, comptime len: usize, value: [len]Child) ?[l
     return null;
 }
 
-fn shrinkStruct(comptime T: type, comptime s: std.builtin.Type.Struct, value: T) ?T {
-    var result = value;
-    inline for (s.fields) |field| {
-        const field_val = @field(value, field.name);
-        if (shrinkOnce(field.type, field_val)) |simpler| {
-            @field(result, field.name) = simpler;
-            return result;
+fn shrinkArrayField(
+    comptime T: type,
+    value: T,
+    comptime property: anytype,
+    budget: *usize,
+    config: ShrinkConfig,
+) ?T {
+    const arr = @typeInfo(T).array;
+    var i: usize = 0;
+    while (i < arr.len) : (i += 1) {
+        if (comptime (@typeInfo(arr.child) == .@"union")) {
+            const Elem = arr.child;
+            const Context = struct { value: *const T, index: usize, budget: *usize };
+            var ctx = Context{ .value = &value, .index = i, .budget = budget };
+            if (findUnionCandidate(Elem, value[i], config, &ctx, property, struct {
+                fn accept(context: *Context, candidate_elem: Elem, comptime prop: anytype) bool {
+                    var candidate = context.value.*;
+                    candidate[context.index] = candidate_elem;
+                    return tryCandidate(T, candidate, prop, context.budget);
+                }
+            }.accept)) |union_candidate| {
+                var candidate = value;
+                candidate[i] = union_candidate;
+                return candidate;
+            }
+            continue;
+        }
+
+        if (shrinkOnceWithConfig(arr.child, value[i], config)) |simpler| {
+            var candidate = value;
+            candidate[i] = simpler;
+            if (tryCandidate(T, candidate, property, budget)) return candidate;
+        }
+        if (comptime (@typeInfo(arr.child) == .int)) {
+            if (shrinkIntStep(arr.child, value[i])) |step| {
+                var candidate = value;
+                candidate[i] = step;
+                if (tryCandidate(T, candidate, property, budget)) return candidate;
+            }
         }
     }
     return null;
 }
 
-fn shrinkStructField(comptime T: type, value: T, comptime property: anytype) ?T {
-    const s = @typeInfo(T).@"struct";
+fn shrinkStruct(comptime T: type, comptime s: std.builtin.Type.Struct, value: T, config: ShrinkConfig) ?T {
+    var result = value;
     inline for (s.fields) |field| {
-        const field_val = @field(value, field.name);
-        if (shrinkOnce(field.type, field_val)) |simpler| {
-            var candidate = value;
-            @field(candidate, field.name) = simpler;
-            if (!property(candidate)) {
-                return candidate;
+        if (field.is_comptime) {
+            continue;
+        }
+        const has_default = comptime (field.defaultValue() != null);
+        if (!config.use_default_values or !has_default) {
+            const field_val = @field(value, field.name);
+            if (shrinkOnceWithConfig(field.type, field_val, config)) |simpler| {
+                @field(result, field.name) = simpler;
+                return result;
             }
         }
     }
     return null;
+}
+
+fn shrinkStructField(
+    comptime T: type,
+    value: T,
+    comptime property: anytype,
+    budget: *usize,
+    config: ShrinkConfig,
+) ?T {
+    const s = @typeInfo(T).@"struct";
+    inline for (s.fields) |field| {
+        if (field.is_comptime) {
+            continue;
+        }
+        const has_default = comptime (field.defaultValue() != null);
+        if (!config.use_default_values or !has_default) {
+            const field_val = @field(value, field.name);
+            if (comptime (@typeInfo(field.type) == .@"union")) {
+                const FieldType = field.type;
+                const Context = struct { value: *const T, budget: *usize };
+                var ctx = Context{ .value = &value, .budget = budget };
+                if (findUnionCandidate(FieldType, field_val, config, &ctx, property, struct {
+                    fn accept(context: *Context, candidate_union: FieldType, comptime prop: anytype) bool {
+                        var candidate = context.value.*;
+                        @field(candidate, field.name) = candidate_union;
+                        return tryCandidate(T, candidate, prop, context.budget);
+                    }
+                }.accept)) |union_candidate| {
+                    var candidate = value;
+                    @field(candidate, field.name) = union_candidate;
+                    return candidate;
+                }
+                continue;
+            }
+            if (shrinkOnceWithConfig(field.type, field_val, config)) |simpler| {
+                var candidate = value;
+                @field(candidate, field.name) = simpler;
+                if (tryCandidate(T, candidate, property, budget)) return candidate;
+            }
+            if (comptime (@typeInfo(field.type) == .int)) {
+                if (shrinkIntStep(field.type, field_val)) |step| {
+                    var candidate = value;
+                    @field(candidate, field.name) = step;
+                    if (tryCandidate(T, candidate, property, budget)) return candidate;
+                }
+            }
+        }
+    }
+    return null;
+}
+
+fn shrinkBoundedSliceField(
+    comptime T: type,
+    value: T,
+    comptime property: anytype,
+    budget: *usize,
+    config: ShrinkConfig,
+) ?T {
+    const Elem = T.Elem;
+    var i: usize = 0;
+    while (i < value.len) : (i += 1) {
+        if (comptime (@typeInfo(Elem) == .@"union")) {
+            const Context = struct { value: *const T, index: usize, budget: *usize };
+            var ctx = Context{ .value = &value, .index = i, .budget = budget };
+            if (findUnionCandidate(Elem, value.buf[i], config, &ctx, property, struct {
+                fn accept(context: *Context, candidate_elem: Elem, comptime prop: anytype) bool {
+                    var candidate = context.value.*;
+                    candidate.buf[context.index] = candidate_elem;
+                    return tryCandidate(T, candidate, prop, context.budget);
+                }
+            }.accept)) |union_candidate| {
+                var candidate = value;
+                candidate.buf[i] = union_candidate;
+                return candidate;
+            }
+            continue;
+        }
+        if (shrinkOnceWithConfig(Elem, value.buf[i], config)) |simpler| {
+            var candidate = value;
+            candidate.buf[i] = simpler;
+            if (tryCandidate(T, candidate, property, budget)) return candidate;
+        }
+        if (comptime (@typeInfo(Elem) == .int)) {
+            if (shrinkIntStep(Elem, value.buf[i])) |step| {
+                var candidate = value;
+                candidate.buf[i] = step;
+                if (tryCandidate(T, candidate, property, budget)) return candidate;
+            }
+        }
+    }
+    return null;
+}
+
+fn shrinkUnion(comptime T: type, comptime u: std.builtin.Type.Union, value: T, config: ShrinkConfig) ?T {
+    if (u.tag_type == null) return null;
+    const tag = std.meta.activeTag(value);
+    inline for (u.fields) |field| {
+        const field_tag = @field(u.tag_type.?, field.name);
+        if (field_tag == tag) {
+            const payload = @field(value, field.name);
+            if (shrinkOnceWithConfig(field.type, payload, config)) |simpler| {
+                return @unionInit(T, field.name, simpler);
+            }
+            break;
+        }
+    }
+    return null;
+}
+
+fn findUnionCandidate(
+    comptime UnionT: type,
+    value: UnionT,
+    config: ShrinkConfig,
+    context: anytype,
+    comptime property: anytype,
+    comptime accept: anytype,
+) ?UnionT {
+    const u = @typeInfo(UnionT).@"union";
+    if (u.tag_type == null) return null;
+
+    const tag = std.meta.activeTag(value);
+    var current_index: usize = 0;
+    var found = false;
+
+    inline for (u.fields, 0..) |field, i| {
+        const field_tag = @field(u.tag_type.?, field.name);
+        if (field_tag == tag) {
+            found = true;
+            current_index = i;
+            const payload = @field(value, field.name);
+            if (shrinkOnceWithConfig(field.type, payload, config)) |simpler| {
+                const candidate = @unionInit(UnionT, field.name, simpler);
+                if (accept(context, candidate, property)) return candidate;
+            }
+            if (comptime (@typeInfo(field.type) == .int)) {
+                if (shrinkIntStep(field.type, payload)) |step| {
+                    const candidate = @unionInit(UnionT, field.name, step);
+                    if (accept(context, candidate, property)) return candidate;
+                }
+            }
+            break;
+        }
+    }
+
+    if (!found) return null;
+
+    inline for (u.fields, 0..) |field, i| {
+        if (i >= current_index) break;
+        const candidate = @unionInit(UnionT, field.name, minimalValue(field.type, config));
+        if (accept(context, candidate, property)) return candidate;
+    }
+    return null;
+}
+
+fn minimalValue(comptime T: type, config: ShrinkConfig) T {
+    if (T == String) return String{};
+    if (T == Id) {
+        var id = Id{};
+        id.len = Id.MIN_LEN;
+        @memset(id.buf[0..Id.MIN_LEN], 'a');
+        return id;
+    }
+    if (T == FilePath) {
+        var fp = FilePath{};
+        const ext = file_path_extensions[0];
+        fp.buf[0] = '/';
+        fp.buf[1] = 'a';
+        std.mem.copyForwards(u8, fp.buf[2 .. 2 + ext.len], ext);
+        fp.len = 2 + ext.len;
+        return fp;
+    }
+    if (comptime isBoundedSlice(T)) {
+        var result: T = undefined;
+        result.len = 0;
+        return result;
+    }
+
+    return switch (@typeInfo(T)) {
+        .int => @as(T, 0),
+        .float => @as(T, 0.0),
+        .bool => false,
+        .optional => @as(T, null),
+        .array => |arr| blk: {
+            var result: [arr.len]arr.child = undefined;
+            var i: usize = 0;
+            while (i < arr.len) : (i += 1) {
+                result[i] = minimalValue(arr.child, config);
+            }
+            break :blk result;
+        },
+        .@"struct" => |s| blk: {
+            var result: T = undefined;
+            inline for (s.fields) |field| {
+                if (field.is_comptime) {
+                    if (field.defaultValue()) |default_value| {
+                        @field(result, field.name) = default_value;
+                        continue;
+                    }
+                    @compileError("Cannot build minimal value for comptime field without default: " ++ field.name);
+                }
+                if (config.use_default_values) {
+                    if (field.defaultValue()) |default_value| {
+                        @field(result, field.name) = default_value;
+                        continue;
+                    }
+                }
+                @field(result, field.name) = minimalValue(field.type, config);
+            }
+            break :blk result;
+        },
+        .@"enum" => |e| @enumFromInt(e.fields[0].value),
+        else => @compileError("Cannot build minimal value for type: " ++ @typeName(T)),
+    };
 }
 
 //
@@ -396,9 +887,16 @@ pub fn intRange(comptime T: type, random: std.Random, min: T, max: T) T {
     std.debug.assert(min <= max);
     if (min == max) return min;
 
-    const range: u64 = @intCast(@as(i128, max) - @as(i128, min) + 1);
-    const offset: T = @intCast(random.uintLessThan(u64, range));
-    return min + offset;
+    const U = std.meta.Int(.unsigned, @bitSizeOf(T));
+    const u_min: U = @bitCast(min);
+    const u_max: U = @bitCast(max);
+    const range: U = u_max -% u_min +% @as(U, 1);
+    if (range == 0) {
+        return @as(T, @bitCast(random.int(U)));
+    }
+    const offset = random.uintLessThan(U, range);
+    const u_val = u_min +% offset;
+    return @as(T, @bitCast(u_val));
 }
 
 /// Generate an array of random bytes.
@@ -438,6 +936,19 @@ test "generate structs" {
     }
 }
 
+test "generate structs respects default values" {
+    var prng = std.Random.DefaultPrng.init(12345);
+    const random = prng.random();
+
+    const Sample = struct {
+        comptime flag: bool = true,
+        value: u8 = 7,
+    };
+
+    const v = generate(Sample, random);
+    try testing.expectEqual(Sample{ .value = 7 }, v);
+}
+
 test "generate arrays" {
     var prng = std.Random.DefaultPrng.init(12345);
     const random = prng.random();
@@ -473,6 +984,18 @@ test "check fails for false property" {
     }.prop, .{ .iterations = 100, .seed = 12345, .expect_failure = true });
 }
 
+test "checkResult returns failure details" {
+    const failure = checkResult(struct {
+        fn prop(args: struct { a: u8 }) bool {
+            return args.a == 0;
+        }
+    }.prop, .{ .iterations = 50, .seed = 12345 });
+
+    try testing.expect(failure != null);
+    try testing.expectEqual(@as(u64, 12345), failure.?.seed);
+    try testing.expectEqual(@as(u8, 1), failure.?.shrunk.a);
+}
+
 test "intRange generates in bounds" {
     var prng = std.Random.DefaultPrng.init(12345);
     const random = prng.random();
@@ -480,6 +1003,30 @@ test "intRange generates in bounds" {
     for (0..1000) |_| {
         const v = intRange(i32, random, -100, 100);
         try testing.expect(v >= -100 and v <= 100);
+    }
+}
+
+test "intRange handles large ranges" {
+    var prng = std.Random.DefaultPrng.init(12345);
+    const random = prng.random();
+
+    const min_i = std.math.minInt(i128);
+    const max_i = std.math.maxInt(i128);
+    for (0..100) |_| {
+        const v = intRange(i128, random, min_i, max_i);
+        try testing.expect(v >= min_i and v <= max_i);
+    }
+
+    const max_u = std.math.maxInt(u128);
+    for (0..100) |_| {
+        const v = intRange(u128, random, 0, max_u);
+        try testing.expect(v <= max_u);
+    }
+
+    const near_max = max_u - 100;
+    for (0..100) |_| {
+        const v = intRange(u128, random, near_max, max_u);
+        try testing.expect(v >= near_max and v <= max_u);
     }
 }
 
@@ -526,8 +1073,8 @@ test "generate Id produces valid alphanumeric IDs" {
         const id = generate(Id, random);
         const slice = id.slice();
 
-        // IDs are 8-36 chars
-        try testing.expect(slice.len >= 8 and slice.len <= 36);
+        // IDs are bounded
+        try testing.expect(slice.len >= Id.MIN_LEN and slice.len <= Id.MAX_LEN);
 
         // All chars are alphanumeric lowercase
         for (slice) |c| {
@@ -550,6 +1097,18 @@ test "generate FilePath produces valid paths" {
 
         // Has file extension
         try testing.expect(std.mem.lastIndexOfScalar(u8, slice, '.') != null);
+    }
+}
+
+test "generate bounded slice produces valid lengths" {
+    const BS = BoundedSlice(u8, 8);
+    var prng = std.Random.DefaultPrng.init(12345);
+    const random = prng.random();
+
+    for (0..100) |_| {
+        const bs = generate(BS, random);
+        try testing.expect(bs.len <= BS.MAX_LEN);
+        try testing.expectEqual(bs.len, bs.slice().len);
     }
 }
 
@@ -585,10 +1144,10 @@ test "shrink String toward empty" {
 
 test "shrink Id respects minimum length" {
     var id = Id{};
-    id.len = 36;
-    @memset(id.buf[0..36], 'a');
+    id.len = Id.MAX_LEN;
+    @memset(id.buf[0..Id.MAX_LEN], 'a');
 
-    // Shrinks toward 8
+    // Shrinks toward minimum length
     const id1 = shrinkId(id).?;
     try testing.expectEqual(@as(usize, 18), id1.len);
 
@@ -596,10 +1155,40 @@ test "shrink Id respects minimum length" {
     try testing.expectEqual(@as(usize, 9), id2.len);
 
     const id3 = shrinkId(id2).?;
-    try testing.expectEqual(@as(usize, 8), id3.len);
+    try testing.expectEqual(@as(usize, Id.MIN_LEN), id3.len);
 
-    // Cannot shrink below 8
+    // Cannot shrink below minimum length
     try testing.expectEqual(@as(?Id, null), shrinkId(id3));
+}
+
+test "shrink FilePath preserves extension" {
+    var fp = FilePath{};
+    const path = "/abcdefghij.zig";
+    @memcpy(fp.buf[0..path.len], path);
+    fp.len = path.len;
+
+    const shrunk = shrinkFilePath(fp).?;
+    const slice = shrunk.slice();
+    try testing.expectEqual(@as(u8, '/'), slice[0]);
+    try testing.expect(std.mem.endsWith(u8, slice, ".zig"));
+    try testing.expect(shrunk.len < fp.len);
+}
+
+test "shrink bounded slice finds failing element" {
+    const BS = BoundedSlice(u8, 4);
+    var value: BS = .{};
+    value.len = 1;
+    value.buf[0] = 10;
+
+    const shrunk = shrinkLoop(BS, struct {
+        fn prop(args: BS) bool {
+            if (args.len == 0) return true;
+            return args.buf[0] == 0;
+        }
+    }.prop, value, 100, .{});
+
+    try testing.expectEqual(@as(usize, 1), shrunk.len);
+    try testing.expectEqual(@as(u8, 1), shrunk.buf[0]);
 }
 
 test "check with String finds minimal counterexample" {
@@ -616,7 +1205,7 @@ test "check with struct containing String" {
     try check(struct {
         fn prop(args: struct { id: Id, name: String, count: u8 }) bool {
             // Property: all IDs have minimum length
-            return args.id.slice().len >= 8;
+            return args.id.slice().len >= Id.MIN_LEN;
         }
     }.prop, .{ .iterations = 100 });
 }
@@ -667,6 +1256,68 @@ test "generate enum" {
     }
 }
 
+test "shrink enum follows declaration order" {
+    const Choice = enum { first, second, third };
+    try testing.expectEqual(Choice.second, shrinkEnum(Choice, Choice.third).?);
+    try testing.expectEqual(Choice.first, shrinkEnum(Choice, Choice.second).?);
+    try testing.expectEqual(@as(?Choice, null), shrinkEnum(Choice, Choice.first));
+}
+
+test "generate tagged union" {
+    const Choice = union(enum) { a: u8, b: i16, c: bool };
+    var prng = std.Random.DefaultPrng.init(12345);
+    const random = prng.random();
+
+    var counts = [_]usize{ 0, 0, 0 };
+    for (0..300) |_| {
+        const value = generate(Choice, random);
+        switch (std.meta.activeTag(value)) {
+            .a => counts[0] += 1,
+            .b => counts[1] += 1,
+            .c => counts[2] += 1,
+        }
+    }
+
+    for (counts) |count| {
+        try testing.expect(count > 50 and count < 150);
+    }
+}
+
+test "shrink union payload" {
+    const U = union(enum) { a: u8, b: u8 };
+    const failure = checkResult(struct {
+        fn prop(args: struct { u: U }) bool {
+            return switch (args.u) {
+                .b => |v| v <= 1,
+                else => true,
+            };
+        }
+    }.prop, .{ .iterations = 200, .seed = 12345 });
+
+    try testing.expect(failure != null);
+    const shrunk = failure.?.shrunk.u;
+    switch (shrunk) {
+        .b => |v| try testing.expectEqual(@as(u8, 2), v),
+        else => try testing.expect(false),
+    }
+}
+
+test "shrink union switches to earliest tag" {
+    const U = union(enum) { a: u8, b: u8 };
+    const failure = checkResult(struct {
+        fn prop(_: struct { u: U }) bool {
+            return false;
+        }
+    }.prop, .{ .iterations = 1, .seed = 12345 });
+
+    try testing.expect(failure != null);
+    const shrunk = failure.?.shrunk.u;
+    switch (shrunk) {
+        .a => |v| try testing.expectEqual(@as(u8, 0), v),
+        else => try testing.expect(false),
+    }
+}
+
 test "generate bool" {
     var prng = std.Random.DefaultPrng.init(12345);
     const random = prng.random();
@@ -693,10 +1344,24 @@ test "generate float produces reasonable values" {
     var prng = std.Random.DefaultPrng.init(12345);
     const random = prng.random();
 
-    for (0..100) |_| {
-        const f = generate(f32, random);
-        // Should not be NaN or Inf (our generator doesn't produce those)
-        try testing.expect(!std.math.isNan(f));
-        try testing.expect(!std.math.isInf(f));
+    for (0..200) |_| {
+        const f16_val = generate(f16, random);
+        try testing.expect(!std.math.isNan(f16_val));
+        try testing.expect(!std.math.isInf(f16_val));
     }
+
+    for (0..200) |_| {
+        const f32_val = generate(f32, random);
+        try testing.expect(!std.math.isNan(f32_val));
+        try testing.expect(!std.math.isInf(f32_val));
+    }
+
+    var negative_count: usize = 0;
+    for (0..1000) |_| {
+        const f64_val = generate(f64, random);
+        try testing.expect(!std.math.isNan(f64_val));
+        try testing.expect(!std.math.isInf(f64_val));
+        if (f64_val < 0.0) negative_count += 1;
+    }
+    try testing.expect(negative_count > 200 and negative_count < 800);
 }

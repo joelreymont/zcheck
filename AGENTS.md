@@ -16,9 +16,9 @@ src/
 ### Core Components
 
 1. **`check()`** - Main entry point. Takes a property function and config, runs iterations.
-2. **`generate()`** - Type-driven random value generation. Handles integers, floats, bools, enums, optionals, arrays, structs, String, Id, FilePath.
-3. **`shrinkOnce()`** / **`shrinkLoop()`** - Shrinking logic to find minimal counterexamples.
-4. **Bounded string types** - `String`, `Id`, `FilePath` for allocation-free string testing.
+2. **`generate()`** - Type-driven random value generation. Handles integers, floats, bools, enums, optionals, arrays, structs, tagged unions, String, Id, FilePath, BoundedSlice.
+3. **`shrinkOnce()`** / **`shrinkLoop()`** - Shrinking logic to find minimal counterexamples (including enums/unions).
+4. **Bounded types** - `String`, `Id`, `FilePath`, `BoundedSlice` for allocation-free testing.
 5. **Constrained generators** - `intRange()`, `bytes()` for controlled generation.
 
 ## Key Design Decisions
@@ -63,12 +63,15 @@ zig build test
 zig build example
 ```
 
+## Docs
+
+- `docs/zig-0.15-io-api.md` - Zig 0.15 IO API changes reference.
+
 ## Known Limitations
 
-- Cannot generate slices (use String, Id, FilePath instead)
+- Cannot generate slices (use String, Id, FilePath, or BoundedSlice instead)
 - Cannot generate pointers
-- Enum shrinking is a no-op (no meaningful ordering)
-- Union types not supported
+- Untagged unions are not supported
 
 ## Future Enhancements (if needed)
 

@@ -6,8 +6,10 @@ A property-based testing library for Zig, inspired by Haskell's QuickCheck and P
 
 - **Typed generators** for integers, floats, booleans, enums, optionals, arrays, and structs
 - **Bounded string types** (String, Id, FilePath) - no allocation needed
+- **Bounded generic slices** with `BoundedSlice(T, N)`
 - **Automatic shrinking** to find minimal counterexamples
 - **Reproducible failures** via configurable seeds
+- **Structured failure reporting** via `checkResult`
 
 ## Installation
 
@@ -79,12 +81,14 @@ test "sort is idempotent" {
 | `f16`, `f32`, `f64` | Random values with 20% special cases (0, 1, -1, min, max) |
 | `bool` | Uniform random |
 | `enum` | Uniform random over variants |
+| `union(enum)` | Uniform random over variants (tagged unions only) |
 | `?T` | 50% null, 50% generated value |
 | `[N]T` | Array with each element generated |
 | `struct` | Each field generated independently |
 | `String` | Bounded printable ASCII (64 bytes max), 10% empty |
 | `Id` | Bounded alphanumeric ID (8-36 chars) |
 | `FilePath` | Bounded file path with extension (128 bytes max) |
+| `BoundedSlice(T, N)` | Bounded slice with generated elements |
 
 ## Configuration
 
@@ -94,7 +98,20 @@ try zc.check(myProperty, .{
     .seed = 12345,           // Fixed seed for reproducibility (default: timestamp)
     .max_shrinks = 200,      // Maximum shrink attempts (default: 100)
     .expect_failure = false, // Pass if property fails (for testing shrinking)
+    .print_failures = true,  // Print counterexample details on failure
+    .use_default_values = true, // Respect struct field defaults
+    .random = null,          // Optional external RNG (e.g., prng.random())
 });
+```
+
+## Failure Details
+
+```zig
+if (zc.checkResult(myProperty, .{ .seed = 12345 })) |failure| {
+    std.debug.print("Seed: {}\\n", .{failure.seed});
+    std.debug.print("Original: {any}\\n", .{failure.original});
+    std.debug.print("Shrunk:   {any}\\n", .{failure.shrunk});
+}
 ```
 
 ## Shrinking
@@ -107,9 +124,12 @@ When a counterexample is found, zcheck automatically shrinks it toward a minimal
 - **Optionals**: `some(x)` shrinks to `null`
 - **Arrays**: Elements shrink individually
 - **Structs**: Fields shrink individually
+- **Enums**: Shrink toward earlier declaration order
+- **Tagged unions**: Shrink active payload, then earlier tags
 - **String**: Shrinks toward empty by halving length
 - **Id**: Shrinks toward minimum length (8 chars)
-- **FilePath**: Shrinks toward minimum length (6 chars)
+- **FilePath**: Shrinks name length while preserving extension
+- **BoundedSlice**: Shrinks length and elements
 
 Example output:
 ```
@@ -136,6 +156,10 @@ const b = zc.bytes(16, random);
 
 // Create String from slice
 const s = zc.String.fromSlice("hello");
+
+// Create bounded slice from slice
+const Bytes = zc.BoundedSlice(u8, 16);
+const bs = Bytes.fromSlice("hello");
 ```
 
 ## Running Tests
